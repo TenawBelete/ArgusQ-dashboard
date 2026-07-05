@@ -158,7 +158,6 @@ def check_kafka() -> tuple[bool, str]:
             bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
             client_id="argusq-dashboard-health",
             request_timeout_ms=2500,
-            api_version_auto_timeout_ms=2500,
         )
         topics = admin.list_topics()
         admin.close()
@@ -234,40 +233,65 @@ def _delta_schema_names(dt):
 
 @st.cache_data(ttl=UI_REFRESH_SECS)
 def check_gold_table() -> tuple[bool, str, pd.DataFrame | None]:
-    """Open the Delta gold table and return its rows (or the real error).
+    """
+    Open the Delta gold table and return its rows.
 
-    Reads only the columns the dashboard uses (column pruning) so the transfer
-    stays small even if the table grows to many thousands of scored rows.
+    STREAMLIT CLOUD FIX:
+    Do not use dt.schema().to_pyarrow().names because Streamlit Cloud may install
+    a deltalake version where Schema has no to_pyarrow method.
+    Instead, read the table and validate required columns afterward.
     """
     if DeltaTable is None:
         return False, "deltalake package not installed.", None
+
     if not DELTA_GOLD:
         return False, "DELTA_GOLD not configured in settings.", None
 
     gold_path = _deltalake_path(f"{DELTA_GOLD}/secom")
+
     required_cols = {
-        "timestamp", "row_id", "raw_prob", "cal_prob",
-        "alert", "risk_level", "label", "scored_at",
+        "timestamp",
+        "row_id",
+        "raw_prob",
+        "cal_prob",
+        "alert",
+        "risk_level",
+        "label",
+        "scored_at",
     }
-    # Optional columns from v7 upgrades - loaded if present, skipped gracefully if not.
-    optional_cols = {"drift_score", "top_shap_feat", "top_shap_value"}
+
+    optional_cols = {
+        "drift_score",
+        "top_shap_feat",
+        "top_shap_value",
+    }
+
     try:
         dt = DeltaTable(gold_path, storage_options=STORAGE_OPTIONS)
-        available = set(_delta_schema_names(dt))
-        cols_to_read = sorted(required_cols | (optional_cols & available))
+
         try:
-            df = dt.to_pandas(columns=cols_to_read)
-        except Exception as col_exc:
-            return False, f"Gold table missing or unreadable columns: {col_exc}", None
+            df = dt.to_pandas()
+        except Exception as read_exc:
+            return False, f"Gold table unreadable: {read_exc}", None
 
         if df.empty:
             return False, "Gold table exists but has zero rows (pipeline not run yet).", None
 
+        missing_cols = sorted(required_cols - set(df.columns))
+        if missing_cols:
+            return False, f"Gold table missing required columns: {missing_cols}", None
+
+        cols_to_keep = [c for c in sorted(required_cols | optional_cols) if c in df.columns]
+        df = df[cols_to_keep].copy()
+
         df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
         df["scored_at"] = pd.to_datetime(df["scored_at"], errors="coerce")
         df["alert"] = df["alert"].astype(bool)
+
         df = df.sort_values("scored_at", ascending=False)
+
         return True, f"{len(df):,} rows in gold table.", df
+
     except Exception as exc:
         return False, f"Gold read failed: {exc}", None
 
