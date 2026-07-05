@@ -82,8 +82,8 @@ CRITICAL_BAND_MULT = 2.0 # cal_prob >= 2.0x threshold
 # health checks are cached for STATUS_CACHE_SECS - deliberately longer than the
 # refresh interval so MinIO/Kafka are NOT re-pinged on every redraw. This keeps
 # the loop responsive even when a service is down and its check is timing out.
-UI_REFRESH_SECS = 5
-STATUS_CACHE_SECS = 15
+UI_REFRESH_SECS = 30
+STATUS_CACHE_SECS = 60
 
 # MinIO / S3 endpoint for the live status ping. Read from STORAGE_OPTIONS if
 # present so we don't duplicate config; fall back to the local dev defaults
@@ -270,9 +270,13 @@ def check_gold_table() -> tuple[bool, str, pd.DataFrame | None]:
         dt = DeltaTable(gold_path, storage_options=STORAGE_OPTIONS)
 
         try:
-            df = dt.to_pandas()
-        except Exception as read_exc:
-            return False, f"Gold table unreadable: {read_exc}", None
+            desired_cols = sorted(required_cols | optional_cols)
+            df = dt.to_pandas(columns=desired_cols)
+        except Exception:
+            try:
+                df = dt.to_pandas(columns=sorted(required_cols))
+            except Exception as read_exc:
+                return False, f"Gold table unreadable: {read_exc}", None
 
         if df.empty:
             return False, "Gold table exists but has zero rows (pipeline not run yet).", None
@@ -449,7 +453,7 @@ threshold = st.sidebar.number_input(
 )
 
 row_window = st.sidebar.slider("Rows to display", 50, 1000, 240, 50)
-auto_refresh = st.sidebar.toggle("Auto-refresh every 5s", value=(mode == "Live (read pipeline)"))
+auto_refresh = st.sidebar.toggle("Auto-refresh every 30s", value=False)
 
 st.sidebar.markdown("---")
 st.sidebar.caption(
