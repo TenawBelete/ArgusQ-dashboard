@@ -9,13 +9,16 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 
 def get_setting(name: str, default: str) -> str:
     """
-    Read config from:
+    Read configuration from:
     1. Streamlit Cloud secrets
     2. Environment variables
     3. Local defaults
+
+    This allows the same dashboard to run locally and on Streamlit Cloud.
     """
     try:
         import streamlit as st
+
         if name in st.secrets:
             return str(st.secrets[name])
     except Exception:
@@ -24,7 +27,10 @@ def get_setting(name: str, default: str) -> str:
     return os.getenv(name, default)
 
 
-# MinIO / S3-compatible object store
+# ---------------------------------------------------------------------
+# MinIO / S3-compatible storage
+# ---------------------------------------------------------------------
+
 MINIO_ENDPOINT = get_setting("MINIO_ENDPOINT", "http://localhost:9000")
 MINIO_ACCESS_KEY = get_setting("MINIO_ACCESS_KEY", "argusq_admin")
 MINIO_SECRET_KEY = get_setting("MINIO_SECRET_KEY", "argusq_password")
@@ -44,37 +50,55 @@ DELTA_SILVER = f"s3a://{MINIO_BUCKET}/silver"
 DELTA_GOLD = f"s3a://{MINIO_BUCKET}/gold"
 
 
+# ---------------------------------------------------------------------
 # Kafka
-# On Streamlit Cloud, Kafka may remain unreachable unless exposed separately.
-# The deployed dashboard can still read the Delta Gold table through MinIO/ngrok.
+# ---------------------------------------------------------------------
+# On Streamlit Cloud, Kafka will usually remain unreachable unless exposed
+# separately. That is okay for this deployment because the dashboard reads
+# the Delta Gold table from MinIO through ngrok.
+
 KAFKA_BROKER = get_setting("KAFKA_BROKER", "localhost:9092")
 KAFKA_BOOTSTRAP_SERVERS = get_setting("KAFKA_BOOTSTRAP_SERVERS", KAFKA_BROKER)
+
 KAFKA_TOPIC_RAW = "argusq.secom.raw"
 KAFKA_TOPIC_SCORED = "argusq.secom.scored"
 KAFKA_GROUP_ID = "argusq-spark-consumer"
 KAFKA_AUTO_OFFSET = "earliest"
 
 
+# ---------------------------------------------------------------------
 # Spark
+# ---------------------------------------------------------------------
+
 SPARK_APP_NAME = "ArgusQ"
 SPARK_MASTER = get_setting("SPARK_MASTER", "local[*]")
 SPARK_SHUFFLE_PARTS = 8
 
 
+# ---------------------------------------------------------------------
 # Data paths
+# ---------------------------------------------------------------------
+
 RAW_SECOM = BASE_DIR / "data" / "processed" / "secom" / "secom_scaled_stream.csv"
+
 MODELS_DIR = BASE_DIR / "models"
 SECOM_DRIFT_MODEL = MODELS_DIR / "secom_t2.joblib"
 SECOM_RISK_MODEL = MODELS_DIR / "secom_xgb.joblib"
 SECOM_PREPROCESSOR = MODELS_DIR / "secom_preprocessor.joblib"
 
 
+# ---------------------------------------------------------------------
 # Streaming
+# ---------------------------------------------------------------------
+
 STREAM_INTERVAL_SECS = 2
 STREAM_TRIGGER_MS = 5000
 
 
+# ---------------------------------------------------------------------
 # Domain
+# ---------------------------------------------------------------------
+
 DOMAIN = "secom"
 LABEL_COL = "label"
 TIMESTAMP_COL = "timestamp"
