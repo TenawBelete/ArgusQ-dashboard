@@ -174,6 +174,64 @@ def _deltalake_path(path: str) -> str:
     return path.replace("s3a://", "s3://", 1)
 
 
+def _delta_schema_names(dt):
+    """
+    Return Delta table column names across different deltalake versions.
+
+    Local deltalake versions may support:
+        dt.schema().to_pyarrow().names
+
+    Streamlit Cloud currently installed a version where Schema has no
+    to_pyarrow() method, so this helper supports multiple schema formats.
+    """
+    import json
+
+    schema = dt.schema()
+
+    # Method 1: older/local deltalake versions
+    try:
+        if hasattr(schema, "to_pyarrow"):
+            return list(schema.to_pyarrow().names)
+    except Exception:
+        pass
+
+    # Method 2: schema.fields as property or method
+    try:
+        fields = schema.fields
+        if callable(fields):
+            fields = fields()
+
+        names = []
+        for field in fields:
+            name = getattr(field, "name", None)
+            if name is None and isinstance(field, dict):
+                name = field.get("name")
+            if name:
+                names.append(str(name))
+
+        if names:
+            return names
+    except Exception:
+        pass
+
+    # Method 3: JSON fallback
+    try:
+        if hasattr(schema, "to_json"):
+            payload = json.loads(schema.to_json())
+        elif hasattr(schema, "json"):
+            payload = json.loads(schema.json())
+        else:
+            payload = None
+
+        if isinstance(payload, dict) and "fields" in payload:
+            return [str(f["name"]) for f in payload["fields"] if "name" in f]
+    except Exception:
+        pass
+
+    raise RuntimeError(f"Could not read Delta schema names from schema object: {type(schema)}")
+
+
+
 @st.cache_data(ttl=UI_REFRESH_SECS)
 def check_gold_table() -> tuple[bool, str, pd.DataFrame | None]:
     """Open the Delta gold table and return its rows (or the real error).
@@ -195,7 +253,7 @@ def check_gold_table() -> tuple[bool, str, pd.DataFrame | None]:
     optional_cols = {"drift_score", "top_shap_feat", "top_shap_value"}
     try:
         dt = DeltaTable(gold_path, storage_options=STORAGE_OPTIONS)
-        available = set(dt.schema().to_pyarrow().names)
+        available = set(_delta_schema_names(dt))
         cols_to_read = sorted(required_cols | (optional_cols & available))
         try:
             df = dt.to_pandas(columns=cols_to_read)
