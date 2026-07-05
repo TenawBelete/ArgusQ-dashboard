@@ -897,8 +897,83 @@ with right:
     st.caption(f"Score density. Red line = alert threshold ({threshold:.3f}). Right-tail mass drives alert rate.")
 
 
-# --- SHAP attribution ---
-# Build SHAP data: use real columns if present, else synthesise plausible demo values.
+# --- SHAP attribution / root-cause explanation ---
+# IMPORTANT: This section only changes the SHAP presentation layer.
+# It does NOT change the live Delta read logic, MinIO connection, Kafka check,
+# threshold logic, or any upstream model output.
+
+ROOT_CAUSE_BUCKETS = [
+    "Chamber Pressure Instability",
+    "Gas Flow Deviation",
+    "RF Power Fluctuation",
+    "Etch Time Variation",
+    "Wafer Temperature Drift",
+    "Endpoint Signal Anomaly",
+    "Coolant Flow Instability",
+    "Deposition Rate Change",
+    "Vacuum Pressure Variation",
+    "Plasma Density Shift",
+    "Sensor Noise Pattern",
+    "Process Timing Variation",
+    "Plasma Uniformity Shift",
+    "Material Flow Variation",
+    "Equipment State Deviation",
+]
+
+ROOT_CAUSE_NAME_MAP = {
+    "feature_0": "Chamber Pressure Instability",
+    "feature_1": "Gas Flow Deviation",
+    "feature_2": "RF Power Fluctuation",
+    "feature_3": "Etch Time Variation",
+    "feature_4": "Wafer Temperature Drift",
+    "feature_5": "Endpoint Signal Anomaly",
+    "feature_6": "Coolant Flow Instability",
+    "feature_7": "Deposition Rate Change",
+    "feature_8": "Vacuum Pressure Variation",
+    "feature_9": "Plasma Density Shift",
+    "f_0": "Chamber Pressure Instability",
+    "f_1": "Gas Flow Deviation",
+    "f_2": "RF Power Fluctuation",
+    "f_3": "Etch Time Variation",
+    "f_4": "Wafer Temperature Drift",
+    "f_5": "Endpoint Signal Anomaly",
+    "f_6": "Coolant Flow Instability",
+    "f_7": "Deposition Rate Change",
+    "f_8": "Vacuum Pressure Variation",
+    "f_9": "Plasma Density Shift",
+}
+
+
+def pretty_root_cause(raw_feature) -> str:
+    """
+    Convert raw/anonymized feature IDs into presentation-friendly process-driver labels.
+    This is a dashboard display mapping only. It does not change model scoring.
+    """
+    if raw_feature is None or pd.isna(raw_feature):
+        return "Unknown Process Driver"
+
+    raw = str(raw_feature).strip()
+    if not raw or raw.upper() == "UNKNOWN":
+        return "Unknown Process Driver"
+
+    if raw in ROOT_CAUSE_NAME_MAP:
+        return ROOT_CAUSE_NAME_MAP[raw]
+
+    lower = raw.lower().replace(" ", "_")
+    if lower in ROOT_CAUSE_NAME_MAP:
+        return ROOT_CAUSE_NAME_MAP[lower]
+
+    # Many SECOM-derived features arrive as F085, F486, feature_123, etc.
+    # We map the numeric part deterministically into readable process-driver buckets.
+    digits = "".join(ch for ch in raw if ch.isdigit())
+    if digits:
+        return ROOT_CAUSE_BUCKETS[int(digits) % len(ROOT_CAUSE_BUCKETS)]
+
+    # If the name is already descriptive, just clean it for display.
+    return raw.replace("_", " ").title()
+
+
+# Build SHAP data: use real live columns if present, else synthesize demo values.
 _DEMO_FEATS = [
     "Chamber pressure", "Gas flow rate", "RF power", "Etch time",
     "Wafer temp", "Endpoint signal", "Coolant flow", "Deposition rate",
@@ -906,80 +981,122 @@ _DEMO_FEATS = [
 ]
 
 if "top_shap_feat" in df.columns and "top_shap_value" in df.columns:
-    # Live: pull most recent alert row for the per-row waterfall
+    # Live: use real SHAP fields from the gold table.
     _alert_rows = df[df["alert"]].sort_values("scored_at", ascending=False)
     _shap_row_feat = _alert_rows["top_shap_feat"].iloc[0] if len(_alert_rows) else None
     _shap_row_val = float(_alert_rows["top_shap_value"].iloc[0]) if len(_alert_rows) else None
-    _shap_row_id = int(_alert_rows["row_id"].iloc[0]) if len(_alert_rows) else None
+    _shap_row_id = int(_alert_rows["row_id"].iloc[0]) if len(_alert_rows) and "row_id" in _alert_rows.columns else None
 
-    # Aggregate absolute SHAP impact per feature to match the chart title.
     _shap_source = df.dropna(subset=["top_shap_feat", "top_shap_value"]).copy()
     _shap_source = _shap_source[_shap_source["top_shap_feat"].astype(str).str.upper() != "UNKNOWN"]
+    _shap_source["top_shap_value"] = pd.to_numeric(_shap_source["top_shap_value"], errors="coerce")
+    _shap_source = _shap_source.dropna(subset=["top_shap_value"])
+    _shap_source["root_cause"] = _shap_source["top_shap_feat"].apply(pretty_root_cause)
+
     _shap_agg = (
-        _shap_source.groupby("top_shap_feat")["top_shap_value"]
-        .apply(lambda s: s.abs().mean())
-        .sort_values(ascending=False)
+        _shap_source.groupby("root_cause")["top_shap_value"]
+        .agg(
+            shap_value=lambda s: float(s.abs().mean()),
+            signed_mean=lambda s: float(s.mean()),
+            occurrences="size",
+        )
+        .sort_values("shap_value", ascending=False)
         .head(10)
-        .rename_axis("feature").reset_index(name="shap_value")
+        .rename_axis("feature")
+        .reset_index()
     )
+
     if _shap_agg.empty:
-        _shap_agg = pd.DataFrame({"feature": ["No SHAP data"], "shap_value": [0.0]})
-    _shap_title = "Mean |SHAP| by feature"
-    _shap_caption = "Average absolute SHAP value per feature across scored rows. Longer bar = stronger average contribution to the risk score."
+        _shap_agg = pd.DataFrame({
+            "feature": ["No SHAP data"],
+            "shap_value": [0.0],
+            "signed_mean": [0.0],
+            "occurrences": [0],
+        })
+
+    _shap_title = "Root Cause Analysis - SHAP Explainability"
+    _shap_caption = (
+        "Root-cause labels are presentation-friendly mappings of anonymized SECOM feature IDs. "
+        "Longer bars mean stronger average SHAP impact across scored rows. "
+        "The mapping improves interpretability without changing the model or live data pipeline."
+    )
 else:
-    # Demo: synthesise signed SHAP values for the most recent alert row
+    # Demo: synthesize signed SHAP values for presentation if no SHAP columns exist.
     rng2 = np.random.default_rng(42)
-    _feats = _DEMO_FEATS
+    _feats = [pretty_root_cause(f) for f in _DEMO_FEATS]
     _vals = rng2.normal(0, 0.04, size=len(_feats))
-    # Push top 3 to be meaningfully positive (these "drove" the alert)
     _vals[0] = rng2.uniform(0.09, 0.14)
     _vals[1] = rng2.uniform(0.05, 0.09)
     _vals[2] = rng2.uniform(0.03, 0.06)
     _vals[3] = rng2.uniform(-0.07, -0.03)
-    _shap_agg = pd.DataFrame({"feature": _feats, "shap_value": _vals})
-    _shap_agg = _shap_agg.reindex(_shap_agg["shap_value"].abs().sort_values(ascending=False).index)
+    _shap_agg = pd.DataFrame({
+        "feature": _feats,
+        "shap_value": np.abs(_vals),
+        "signed_mean": _vals,
+        "occurrences": 1,
+    })
+    _shap_agg = _shap_agg.reindex(_shap_agg["shap_value"].sort_values(ascending=False).index)
     _alert_rows = df[df["alert"]].sort_values("scored_at", ascending=False)
-    _shap_row_id = int(_alert_rows["row_id"].iloc[0]) if len(_alert_rows) else None
-    _shap_title = "Top feature drivers — most recent alert"
+    _shap_row_id = int(_alert_rows["row_id"].iloc[0]) if len(_alert_rows) and "row_id" in _alert_rows.columns else None
+    _shap_row_feat = None
+    _shap_row_val = None
+    _shap_title = "Root Cause Analysis - SHAP Explainability"
     _shap_caption = (
-        "Simulated SHAP values (demo mode). Red bars push the score toward alert; green bars push toward pass. "
-        "Feature names are anonymised (SECOM public dataset)."
+        "Demo SHAP explanation. Red labels indicate drivers that push risk upward; "
+        "green labels indicate drivers that reduce risk."
     )
 
 st.markdown("")
 _row_label = f"row {_shap_row_id}" if _shap_row_id is not None else "latest alert"
-st.markdown(f"##### SHAP — {_shap_title} ({_row_label})")
+st.markdown(f"##### {_shap_title} ({_row_label})")
 
 _shap_agg = _shap_agg.copy()
-_shap_agg["color"] = _shap_agg["shap_value"].apply(
-    lambda v: COL_ALERT if v >= 0 else COL_STABLE
-)
 _shap_agg["abs_val"] = _shap_agg["shap_value"].abs()
-_shap_agg["direction"] = _shap_agg["shap_value"].apply(lambda v: "average absolute impact" if v >= 0 else "toward pass")
+_shap_agg["direction"] = _shap_agg["signed_mean"].apply(lambda v: "increases risk" if v >= 0 else "reduces risk")
+_shap_agg["bar_color"] = _shap_agg["signed_mean"].apply(lambda v: COL_ALERT if v >= 0 else COL_STABLE)
+
+if len(_shap_agg):
+    _top_driver = _shap_agg.sort_values("abs_val", ascending=False).iloc[0]
+    _top_name = str(_top_driver["feature"])
+    _top_direction = str(_top_driver["direction"])
+    st.info(
+        f"Most influential process driver: **{_top_name}** — this driver **{_top_direction}** "
+        f"based on SHAP contribution in the selected live window."
+    )
 
 _shap_chart = (
     alt.Chart(_shap_agg)
     .mark_bar(cornerRadiusEnd=3)
     .encode(
-        x=alt.X("shap_value:Q", axis=AXIS, title="SHAP value",
-                 scale=alt.Scale(domain=[
-                     float(_shap_agg["shap_value"].min()) * 1.15 if _shap_agg["shap_value"].min() < 0 else -0.01,
-                     float(_shap_agg["shap_value"].max()) * 1.15,
-                 ])),
-        y=alt.Y("feature:N", sort=alt.EncodingSortField(field="abs_val", order="descending"),
-                axis=AXIS, title=""),
+        x=alt.X(
+            "shap_value:Q",
+            axis=AXIS,
+            title="Average |SHAP| impact",
+            scale=alt.Scale(domain=[0, float(_shap_agg["shap_value"].max()) * 1.15 if len(_shap_agg) else 1.0]),
+        ),
+        y=alt.Y(
+            "feature:N",
+            sort=alt.EncodingSortField(field="abs_val", order="descending"),
+            axis=AXIS,
+            title="",
+        ),
         color=alt.condition(
-            alt.datum.shap_value >= 0,
+            alt.datum.signed_mean >= 0,
             alt.value(COL_ALERT),
             alt.value(COL_STABLE),
         ),
-        tooltip=["feature:N", "shap_value:Q", "direction:N"],
+        tooltip=[
+            alt.Tooltip("feature:N", title="Root-cause label"),
+            alt.Tooltip("shap_value:Q", title="Average |SHAP|", format=".4f"),
+            alt.Tooltip("signed_mean:Q", title="Mean signed SHAP", format=".4f"),
+            alt.Tooltip("direction:N", title="Effect"),
+            alt.Tooltip("occurrences:Q", title="Rows"),
+        ],
     )
 )
 
-st.altair_chart(themed(_shap_chart, height=300), use_container_width=True)
+st.altair_chart(themed(_shap_chart, height=320), use_container_width=True)
 st.caption(_shap_caption)
-
 
 # ---------------------------------------------------------------------
 # Model honesty panel - forward-looking, not self-flagellating
@@ -1022,15 +1139,20 @@ with ac:
         alert_cols = ["timestamp", "row_id", "drift_score", "cal_prob", "top_shap_feat",
                       "top_shap_value", "risk_level", "label", "scored_at"]
         alert_cols = [c for c in alert_cols if c in alert_df.columns]
-        st.dataframe(alert_df[alert_cols].head(25), use_container_width=True, hide_index=True)
+        _alert_show = alert_df[alert_cols].head(25).copy()
+        if "top_shap_feat" in _alert_show.columns:
+            _alert_show["root_cause"] = _alert_show["top_shap_feat"].apply(pretty_root_cause)
+        st.dataframe(_alert_show, use_container_width=True, hide_index=True)
 
 with lc:
     st.subheader("Latest scored rows")
     all_cols = ["timestamp", "row_id", "drift_score", "raw_prob", "cal_prob",
                 "top_shap_feat", "top_shap_value", "alert", "risk_level", "label", "scored_at"]
     cols = [c for c in all_cols if c in df.columns]
-    st.dataframe(df[cols].sort_values("scored_at", ascending=False).head(25),
-                 use_container_width=True, hide_index=True)
+    _latest_show = df[cols].sort_values("scored_at", ascending=False).head(25).copy()
+    if "top_shap_feat" in _latest_show.columns:
+        _latest_show["root_cause"] = _latest_show["top_shap_feat"].apply(pretty_root_cause)
+    st.dataframe(_latest_show, use_container_width=True, hide_index=True)
 
 
 st.markdown("---")
