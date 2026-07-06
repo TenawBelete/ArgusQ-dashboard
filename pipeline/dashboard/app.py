@@ -9,6 +9,11 @@ import pandas as pd
 import streamlit as st
 import altair as alt
 
+try:
+    from streamlit_autorefresh import st_autorefresh
+except Exception:
+    st_autorefresh = None
+
 # Allow imports from the project root when run from pipeline/dashboard/
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -71,6 +76,7 @@ INVESTIGATE_ALERT_PCT = 8.0
 # the loop responsive even when a service is down and its check is timing out.
 UI_REFRESH_SECS = 5
 STATUS_CACHE_SECS = 15
+AUTO_REFRESH_SECS = 30
 
 # MinIO / S3 endpoint for the live status ping. Read from STORAGE_OPTIONS if
 # present so we don't duplicate config; fall back to the local dev defaults
@@ -89,6 +95,12 @@ st.set_page_config(
     page_icon="⚡",
     layout="wide",
 )
+
+# Auto-refresh the Streamlit page every 30 seconds while keeping the manual
+# sidebar refresh button below. This only reruns the dashboard UI; it does not
+# start, stop, or modify Kafka, Spark, Airflow, or MinIO.
+if st_autorefresh is not None:
+    st_autorefresh(interval=AUTO_REFRESH_SECS * 1000, key="argusq_dashboard_autorefresh")
 
 
 # ---------------------------------------------------------------------
