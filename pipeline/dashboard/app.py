@@ -96,12 +96,6 @@ st.set_page_config(
     layout="wide",
 )
 
-# Auto-refresh the Streamlit page every 30 seconds while keeping the manual
-# sidebar refresh button below. This only reruns the dashboard UI; it does not
-# start, stop, or modify Kafka, Spark, Airflow, or MinIO.
-if st_autorefresh is not None:
-    st_autorefresh(interval=AUTO_REFRESH_SECS * 1000, key="argusq_dashboard_autorefresh")
-
 
 # ---------------------------------------------------------------------
 # Real status checks. Nothing here is hardcoded green.
@@ -303,6 +297,22 @@ st.sidebar.markdown("---")
 if st.sidebar.button("🔄 Refresh now", use_container_width=True):
     st.cache_data.clear()
     st.rerun()
+
+auto_refresh_enabled = st.sidebar.toggle(
+    "Auto-refresh every 30s",
+    value=True,
+    help="Turn this off when you do not want the dashboard to rerun automatically. Manual Refresh still works.",
+)
+
+if auto_refresh_enabled:
+    st.sidebar.caption("Auto-refresh is ON: the dashboard reruns every 30 seconds.")
+    if st_autorefresh is not None:
+        st_autorefresh(interval=AUTO_REFRESH_SECS * 1000, key="argusq_dashboard_autorefresh")
+    else:
+        st.sidebar.warning("Auto-refresh package is not installed. Manual Refresh still works.")
+else:
+    st.sidebar.caption("Auto-refresh is OFF. Use Refresh now for manual reloads.")
+
 st.sidebar.caption("Data is cached for 15s. Click Refresh to force an immediate reload.")
 
 st.sidebar.markdown("")
