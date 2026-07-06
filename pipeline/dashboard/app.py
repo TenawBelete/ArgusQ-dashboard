@@ -300,8 +300,8 @@ if st.sidebar.button("🔄 Refresh now", use_container_width=True):
 
 auto_refresh_enabled = st.sidebar.toggle(
     "Auto-refresh every 30s",
-    value=True,
-    help="Turn this off when you do not want the dashboard to rerun automatically. Manual Refresh still works.",
+    value=False,
+    help="Keep this OFF to save tunnel/ngrok quota. Turn it ON only when you want the dashboard to rerun automatically.",
 )
 
 if auto_refresh_enabled:
@@ -754,19 +754,29 @@ if "top_shap_feat" in df.columns and "top_shap_value" in df.columns:
     _shap_row_val = float(_alert_rows["top_shap_value"].iloc[0]) if len(_alert_rows) else None
     _shap_row_id = int(_alert_rows["row_id"].iloc[0]) if len(_alert_rows) else None
 
-    # Aggregate: signed mean SHAP per feature (preserves direction)
+    # Aggregate: mean absolute SHAP per feature for the selected dashboard window.
+    # This matches the chart title: Mean |SHAP|. The source dataframe `df` is already
+    # limited by the sidebar row_window, so this chart does not aggregate over the
+    # entire live table shown in MinIO.
+    _shap_base = df[["top_shap_feat", "top_shap_value"]].dropna().copy()
+    _shap_base["top_shap_feat"] = _shap_base["top_shap_feat"].astype(str)
+    _shap_base["top_shap_value"] = pd.to_numeric(_shap_base["top_shap_value"], errors="coerce")
+    _shap_base = _shap_base.dropna(subset=["top_shap_value"])
+    _shap_base["abs_shap"] = _shap_base["top_shap_value"].abs()
+
     _shap_agg = (
-        df.groupby("top_shap_feat")["top_shap_value"]
+        _shap_base
+        .groupby("top_shap_feat", as_index=False)["abs_shap"]
         .mean()
-        .sort_values(key=lambda s: s.abs(), ascending=False)
+        .sort_values("abs_shap", ascending=False)
         .head(10)
-        .rename_axis("feature").reset_index(name="shap_value")
+        .rename(columns={"top_shap_feat": "feature", "abs_shap": "shap_value"})
         .reset_index(drop=True)
     )
     _shap_agg["feature"] = _shap_agg["feature"].astype(str)
     _shap_agg["shap_value"] = _shap_agg["shap_value"].astype(float)
     _shap_title = "Mean |SHAP| by feature"
-    _shap_caption = "Average absolute SHAP value per feature across all scored rows. Longer bar = stronger average contribution to risk score."
+    _shap_caption = "Average absolute SHAP value per feature in the selected dashboard window. Longer bar = stronger average contribution to risk score."
 else:
     # Demo: synthesise signed SHAP values for the most recent alert row
     rng2 = np.random.default_rng(42)
@@ -795,28 +805,21 @@ _row_label = f"row {_shap_row_id}" if _shap_row_id is not None else "latest aler
 st.markdown(f"##### SHAP — {_shap_title} ({_row_label})")
 
 _shap_agg = _shap_agg.copy()
-_shap_agg["color"] = _shap_agg["shap_value"].apply(
-    lambda v: COL_ALERT if v >= 0 else COL_STABLE
-)
 _shap_agg["abs_val"] = _shap_agg["shap_value"].abs()
-_shap_agg["direction"] = _shap_agg["shap_value"].apply(lambda v: "toward alert" if v >= 0 else "toward pass")
+_shap_agg["direction"] = _shap_agg["shap_value"].apply(lambda v: "mean absolute contribution" if _shap_title == "Mean |SHAP| by feature" else ("toward alert" if v >= 0 else "toward pass"))
 
 _shap_chart = (
     to_chart(_shap_agg)
     .mark_bar(cornerRadiusEnd=3)
     .encode(
-        x=alt.X("shap_value:Q", axis=AXIS, title="SHAP value",
+        x=alt.X("shap_value:Q", axis=AXIS, title="Mean |SHAP value|" if _shap_title == "Mean |SHAP| by feature" else "SHAP value",
                  scale=alt.Scale(domain=[
-                     float(_shap_agg["shap_value"].min()) * 1.15 if _shap_agg["shap_value"].min() < 0 else -0.01,
-                     float(_shap_agg["shap_value"].max()) * 1.15,
+                     0.0 if _shap_title == "Mean |SHAP| by feature" else (float(_shap_agg["shap_value"].min()) * 1.15 if _shap_agg["shap_value"].min() < 0 else -0.01),
+                     max(0.001, float(_shap_agg["shap_value"].max()) * 1.15),
                  ])),
         y=alt.Y("feature:N", sort=alt.EncodingSortField(field="abs_val", order="descending"),
                 axis=AXIS, title=""),
-        color=alt.condition(
-            alt.datum.shap_value >= 0,
-            alt.value(COL_ALERT),
-            alt.value(COL_STABLE),
-        ),
+        color=alt.value(ACCENT if _shap_title == "Mean |SHAP| by feature" else COL_ALERT),
         tooltip=["feature:N", "shap_value:Q", "direction:N"],
     )
 )
