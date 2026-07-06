@@ -8,7 +8,6 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import altair as alt
-import matplotlib.pyplot as plt
 
 # Allow imports from the project root when run from pipeline/dashboard/
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -66,51 +65,19 @@ SECOM_POSITIVE_RATE = 0.066
 ESCALATE_ALERT_PCT = 20.0
 INVESTIGATE_ALERT_PCT = 8.0
 
-# RISK BAND MULTIPLIERS: bands are defined as multiples of the *live*
-# operator threshold, not fixed absolute cal_prob cutoffs. This stream's
-# calibrated scores are compressed (cal_prob rarely exceeds ~0.09), so a
-# fixed cutoff like HIGH_RISK_CUTOFF (0.20) would leave Medium/High/Critical
-# permanently empty no matter how much real risk variation exists, and would
-# never respond to the threshold slider. Scaling off the live threshold keeps
-# the bands meaningful at this stream's actual score range and makes the
-# "Risk band distribution" chart move when the operator adjusts the slider.
-MEDIUM_BAND_MULT = 1.0   # cal_prob >= 1.0x threshold
-HIGH_BAND_MULT = 1.5     # cal_prob >= 1.5x threshold
-CRITICAL_BAND_MULT = 2.0 # cal_prob >= 2.0x threshold
-
 # Refresh cadence. The screen redraws every UI_REFRESH_SECS, but the network
 # health checks are cached for STATUS_CACHE_SECS - deliberately longer than the
 # refresh interval so MinIO/Kafka are NOT re-pinged on every redraw. This keeps
 # the loop responsive even when a service is down and its check is timing out.
-UI_REFRESH_SECS = 30
-STATUS_CACHE_SECS = 60
+UI_REFRESH_SECS = 5
+STATUS_CACHE_SECS = 15
 
 # MinIO / S3 endpoint for the live status ping. Read from STORAGE_OPTIONS if
 # present so we don't duplicate config; fall back to the local dev defaults
 # from the pipeline tutorial.
-def _storage_option(*keys: str, default: str | None = None) -> str | None:
-    """Read storage option keys robustly across lowercase deltalake config and uppercase Rust/AWS config."""
-    if not isinstance(STORAGE_OPTIONS, dict):
-        return default
-    for key in keys:
-        value = STORAGE_OPTIONS.get(key)
-        if value not in (None, ""):
-            return value
-    return default
-
-
-MINIO_ENDPOINT = os.getenv(
-    "MINIO_ENDPOINT",
-    _storage_option("endpoint_url", "AWS_ENDPOINT_URL", default="http://localhost:9000"),
-)
-MINIO_KEY = os.getenv(
-    "MINIO_ACCESS_KEY",
-    _storage_option("aws_access_key_id", "AWS_ACCESS_KEY_ID", default="argusq_admin"),
-)
-MINIO_SECRET = os.getenv(
-    "MINIO_SECRET_KEY",
-    _storage_option("aws_secret_access_key", "AWS_SECRET_ACCESS_KEY", default="argusq_password"),
-)
+MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", STORAGE_OPTIONS.get("AWS_ENDPOINT_URL", "http://localhost:9000"))
+MINIO_KEY = os.getenv("MINIO_ACCESS_KEY", STORAGE_OPTIONS.get("AWS_ACCESS_KEY_ID", "argusq_admin"))
+MINIO_SECRET = os.getenv("MINIO_SECRET_KEY", STORAGE_OPTIONS.get("AWS_SECRET_ACCESS_KEY", "argusq_password"))
 MINIO_BUCKET = os.getenv("MINIO_BUCKET", "argusq-datalake")
 
 KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
@@ -158,6 +125,7 @@ def check_kafka() -> tuple[bool, str]:
             bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
             client_id="argusq-dashboard-health",
             request_timeout_ms=2500,
+            api_version_auto_timeout_ms=2500,
         )
         topics = admin.list_topics()
         admin.close()
@@ -168,157 +136,58 @@ def check_kafka() -> tuple[bool, str]:
         return False, f"Kafka unreachable: {exc}"
 
 
-def _deltalake_path(path: str) -> str:
-    """The Python deltalake reader is safest with s3://; Spark/Hadoop uses s3a://."""
-    return path.replace("s3a://", "s3://", 1)
-
-
-def _delta_schema_names(dt):
-    """
-    Return Delta table column names across different deltalake versions.
-
-    Local deltalake versions may support:
-        dt.schema().to_pyarrow().names
-
-    Streamlit Cloud currently installed a version where Schema has no
-    to_pyarrow() method, so this helper supports multiple schema formats.
-    """
-    import json
-
-    schema = dt.schema()
-
-    # Method 1: older/local deltalake versions
-    try:
-        if hasattr(schema, "to_pyarrow"):
-            return list(schema.to_pyarrow().names)
-    except Exception:
-        pass
-
-    # Method 2: schema.fields as property or method
-    try:
-        fields = schema.fields
-        if callable(fields):
-            fields = fields()
-
-        names = []
-        for field in fields:
-            name = getattr(field, "name", None)
-            if name is None and isinstance(field, dict):
-                name = field.get("name")
-            if name:
-                names.append(str(name))
-
-        if names:
-            return names
-    except Exception:
-        pass
-
-    # Method 3: JSON fallback
-    try:
-        if hasattr(schema, "to_json"):
-            payload = json.loads(schema.to_json())
-        elif hasattr(schema, "json"):
-            payload = json.loads(schema.json())
-        else:
-            payload = None
-
-        if isinstance(payload, dict) and "fields" in payload:
-            return [str(f["name"]) for f in payload["fields"] if "name" in f]
-    except Exception:
-        pass
-
-    raise RuntimeError(f"Could not read Delta schema names from schema object: {type(schema)}")
-
-
-
 @st.cache_data(ttl=UI_REFRESH_SECS)
 def check_gold_table() -> tuple[bool, str, pd.DataFrame | None]:
-    """
-    Open the Delta gold table and return its rows.
+    """Open the Delta gold table and return its rows (or the real error).
 
-    STREAMLIT CLOUD FIX:
-    Do not use dt.schema().to_pyarrow().names because Streamlit Cloud may install
-    a deltalake version where Schema has no to_pyarrow method.
-    Instead, read the table and validate required columns afterward.
+    Reads only the columns the dashboard uses (column pruning) so the transfer
+    stays small even if the table grows to many thousands of scored rows.
     """
     if DeltaTable is None:
         return False, "deltalake package not installed.", None
-
     if not DELTA_GOLD:
         return False, "DELTA_GOLD not configured in settings.", None
 
-    gold_path = _deltalake_path(f"{DELTA_GOLD}/secom")
-
+    gold_path = f"{DELTA_GOLD}/secom"
     required_cols = {
-        "timestamp",
-        "row_id",
-        "raw_prob",
-        "cal_prob",
-        "alert",
-        "risk_level",
-        "label",
-        "scored_at",
+        "timestamp", "row_id", "raw_prob", "cal_prob",
+        "alert", "risk_level", "label", "scored_at",
     }
-
-    optional_cols = {
-        "drift_score",
-        "top_shap_feat",
-        "top_shap_value",
-    }
-
+    # Optional columns from v7 upgrades - loaded if present, skipped gracefully if not.
+    optional_cols = {"drift_score", "top_shap_feat", "top_shap_value"}
     try:
         dt = DeltaTable(gold_path, storage_options=STORAGE_OPTIONS)
-
+        available = set(dt.schema().to_pyarrow().names)
+        cols_to_read = sorted(required_cols | (optional_cols & available))
         try:
-            desired_cols = sorted(required_cols | optional_cols)
-            df = dt.to_pandas(columns=desired_cols)
-        except Exception:
-            try:
-                df = dt.to_pandas(columns=sorted(required_cols))
-            except Exception as read_exc:
-                return False, f"Gold table unreadable: {read_exc}", None
+            df = dt.to_pandas(columns=cols_to_read)
+        except Exception as col_exc:
+            return False, f"Gold table missing or unreadable columns: {col_exc}", None
 
         if df.empty:
             return False, "Gold table exists but has zero rows (pipeline not run yet).", None
 
-        missing_cols = sorted(required_cols - set(df.columns))
-        if missing_cols:
-            return False, f"Gold table missing required columns: {missing_cols}", None
-
-        cols_to_keep = [c for c in sorted(required_cols | optional_cols) if c in df.columns]
-        df = df[cols_to_keep].copy()
-
         df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
         df["scored_at"] = pd.to_datetime(df["scored_at"], errors="coerce")
         df["alert"] = df["alert"].astype(bool)
-
         df = df.sort_values("scored_at", ascending=False)
-
         return True, f"{len(df):,} rows in gold table.", df
-
     except Exception as exc:
         return False, f"Gold read failed: {exc}", None
 
 
 def freshness_label(latest: pd.Timestamp | None) -> tuple[str, str]:
-    """Real freshness derived from the most recent scored_at.
-
-    FRESHNESS_UTC_FINAL_FIX:
-    Spark/Delta scored_at is UTC-like but pandas reads it as timezone-naive.
-    On a UTC+2 local machine, comparing that naive UTC timestamp to local
-    pd.Timestamp.now() makes a live stream look about 120 minutes stale.
-    This function treats naive scored_at as UTC and compares with UTC now.
-    """
+    """Real freshness derived from the most recent scored_at, safely handling timezone-aware timestamps."""
     if latest is None or pd.isna(latest):
         return "unknown", "No scored rows yet."
 
     latest_ts = pd.Timestamp(latest)
-    if latest_ts.tzinfo is None:
-        latest_ts = latest_ts.tz_localize("UTC")
-    else:
-        latest_ts = latest_ts.tz_convert("UTC")
 
-    now_ts = pd.Timestamp.now(tz="UTC")
+    if latest_ts.tzinfo is None:
+        now_ts = pd.Timestamp.now()
+    else:
+        now_ts = pd.Timestamp.now(tz=latest_ts.tz)
+
     secs = max(0, (now_ts - latest_ts).total_seconds())
 
     if secs < 30:
@@ -326,7 +195,6 @@ def freshness_label(latest: pd.Timestamp | None) -> tuple[str, str]:
     if secs < 300:
         return "recent", f"Last batch {int(secs // 60)}m {int(secs % 60)}s ago."
     return "stale", f"Last batch {int(secs // 60)}m ago - stream may have stopped."
-
 
 
 # ---------------------------------------------------------------------
@@ -357,67 +225,23 @@ def make_demo_data(n: int = 240, threshold: float = DEFAULT_THRESHOLD) -> pd.Dat
     cal_prob = np.clip(base + rng.normal(0, 0.008, size=n), 0, 0.45)
     raw_prob = np.clip(cal_prob + rng.normal(0, 0.02, size=n), 0, 1)
 
-    drift_score = np.clip(
-        rng.normal(145, 42, size=n) + np.r_[np.zeros(drift_start), np.linspace(0, 260, n - drift_start)],
-        20,
-        900,
-    )
-    demo_features = np.array([
-        "F059", "F103", "F221", "F348", "F431",
-        "F487", "F512", "F520", "F570", "F589",
-    ])
-    top_shap_feat = rng.choice(demo_features, size=n)
-    top_shap_value = rng.normal(0.018, 0.035, size=n) + (cal_prob >= threshold) * rng.normal(0.05, 0.02, size=n)
-
     df = pd.DataFrame({
         "timestamp": timestamps,
         "row_id": np.arange(n),
         "label": labels,
         "raw_prob": raw_prob,
         "cal_prob": cal_prob,
-        "drift_score": drift_score,
-        "top_shap_feat": top_shap_feat,
-        "top_shap_value": top_shap_value,
         "scored_at": timestamps,
     })
     return df.sort_values("scored_at", ascending=False)
 
 
 def apply_bands(df: pd.DataFrame, threshold: float) -> pd.DataFrame:
-    """Apply alert flags and dashboard risk bands using the current sidebar threshold.
-
-    RISK_BAND_FINAL_FIX: Risk-band distribution must not depend on a stored
-    gold-table risk_level because that column can be stale. The dashboard
-    recalculates bands from cal_prob on every rerun.
-    """
-    df = df.copy().reset_index(drop=True)
-    df["cal_prob"] = pd.to_numeric(df["cal_prob"], errors="coerce").fillna(0.0)
-
-    risk_alert = df["cal_prob"] >= float(threshold)
-    drift_alert = (
-        df["drift_score"] > T2_DRIFT_THRESHOLD
-        if "drift_score" in df.columns
-        else pd.Series(False, index=df.index)
-    )
-    existing_alert = (
-        df["alert"].astype(bool)
-        if "alert" in df.columns
-        else pd.Series(False, index=df.index)
-    )
-    df["alert"] = risk_alert | drift_alert | existing_alert
-
-    medium_cutoff = float(threshold) * MEDIUM_BAND_MULT
-    high_cutoff = float(threshold) * HIGH_BAND_MULT
-    critical_cutoff = float(threshold) * CRITICAL_BAND_MULT
-
-    df["risk_level"] = np.select(
-        [
-            df["cal_prob"] >= critical_cutoff,
-            df["cal_prob"] >= high_cutoff,
-            df["cal_prob"] >= medium_cutoff,
-        ],
-        ["Critical", "High", "Medium"],
-        default="Low",
+    df = df.copy()
+    df["alert"] = df["cal_prob"] >= threshold
+    df["risk_level"] = np.where(
+        df["cal_prob"] >= HIGH_RISK_CUTOFF, "High",
+        np.where(df["cal_prob"] >= threshold, "Medium", "Low"),
     )
     return df
 
@@ -453,9 +277,13 @@ threshold = st.sidebar.number_input(
 )
 
 row_window = st.sidebar.slider("Rows to display", 50, 1000, 240, 50)
-auto_refresh = st.sidebar.toggle("Auto-refresh every 30s", value=False)
-
 st.sidebar.markdown("---")
+if st.sidebar.button("🔄 Refresh now", use_container_width=True):
+    st.cache_data.clear()
+    st.rerun()
+st.sidebar.caption("Data is cached for 15s. Click Refresh to force an immediate reload.")
+
+st.sidebar.markdown("")
 st.sidebar.caption(
     "Live mode degrades honestly: if MinIO is up but the gold table is empty, "
     "or a read fails, the dashboard tells you exactly what is missing rather "
@@ -716,24 +544,46 @@ if drift is not None:
 # ---------------------------------------------------------------------
 AXIS = alt.Axis(labelColor="#8B98A8", titleColor="#8B98A8", gridColor="rgba(120,140,170,0.10)", domainColor=COL_BORDER)
 
+_chart_counter = 0
+
+def to_chart(df_in: pd.DataFrame) -> alt.Chart:
+    """Inline data into the Vega spec. Adds a unique _cid column so that
+    Altair never identifies two calls as having identical data and never
+    extracts them into a shared named dataset (which causes 'Unrecognized
+    data set' errors on rerun)."""
+    global _chart_counter
+    _chart_counter += 1
+    tmp = df_in.copy()
+    tmp["_cid"] = _chart_counter
+    return alt.Chart(alt.Data(values=tmp.to_dict(orient="records")))
+
 def themed(chart, height=260):
-    return chart.properties(height=height).configure_view(strokeWidth=0).configure(background="transparent")
+    return chart.properties(height=height)
 
 # --- Stage 1: Hotelling T² drift chart ---
 if "drift_score" in df.columns:
     st.markdown("##### Stage 1 - Hotelling T² drift score over time")
-    t2_df = df.sort_values("timestamp")[["timestamp", "drift_score"]].copy()
-    t2_line = alt.Chart(t2_df).mark_line(color=ACCENT, strokeWidth=1.4).encode(
+    t2_df = (
+        df.sort_values("timestamp")[["timestamp", "drift_score"]]
+        .copy()
+        .reset_index(drop=True)
+    )
+    t2_df["timestamp"] = pd.to_datetime(t2_df["timestamp"])
+    t2_df["drift_score"] = t2_df["drift_score"].astype(float)
+    t2_line = to_chart(t2_df.copy()).mark_line(color=ACCENT, strokeWidth=1.4).encode(
         x=alt.X("timestamp:T", axis=AXIS, title="time"),
         y=alt.Y("drift_score:Q", axis=AXIS, title="T² score"),
     )
-    t2_breaches = alt.Chart(t2_df).transform_filter(
+    t2_breaches = to_chart(t2_df.copy()).transform_filter(
         alt.datum.drift_score > T2_DRIFT_THRESHOLD
     ).mark_circle(color=COL_ALERT, size=28).encode(x="timestamp:T", y="drift_score:Q")
-    t2_thr = alt.Chart(pd.DataFrame({"y": [T2_DRIFT_THRESHOLD]})).mark_rule(
-        color=COL_ALERT, strokeDash=[5, 4], strokeWidth=1
-    ).encode(y="y:Q")
-    st.altair_chart(themed(alt.layer(t2_line, t2_breaches, t2_thr), height=260), use_container_width=True)
+    _t2_thr_df = pd.DataFrame({"_thr": [float(T2_DRIFT_THRESHOLD)] * len(t2_df)})
+    t2_thr = (
+        to_chart(_t2_thr_df)
+        .mark_rule(color=COL_ALERT, strokeDash=[5, 4], strokeWidth=1)
+        .encode(y=alt.Y("mean(_thr):Q"))
+    )
+    st.altair_chart(themed(t2_line + t2_breaches + t2_thr, height=260), use_container_width=True)
     t2_alerts = int((df["drift_score"] > T2_DRIFT_THRESHOLD).sum())
     st.caption(
         f"{t2_alerts} of {total:,} rows exceed the T² threshold ({T2_DRIFT_THRESHOLD:.0f}). "
@@ -744,83 +594,69 @@ if "drift_score" in df.columns:
 # --- SPC control chart (the quality-manager hero) ---
 st.markdown("##### Process control chart - calibrated risk over time")
 
-# FIX: This chart is rendered with Matplotlib, not Altair/Vega.
-# Reason: Streamlit/Vega was repeatedly throwing "Unrecognized data set" for this layered chart.
-# Keeping this one chart outside Vega removes the dataset-reference failure without changing the KPIs,
-# layout, thresholds, business logic, or the rest of the dashboard.
 spc_df = (
-    df.sort_values("timestamp")[["timestamp", "cal_prob", "alert"]]
+    df.sort_values("timestamp")[["timestamp", "cal_prob"]]
     .copy()
     .reset_index(drop=True)
 )
-spc_df["timestamp"] = pd.to_datetime(spc_df["timestamp"], errors="coerce")
-spc_df["cal_prob"] = pd.to_numeric(spc_df["cal_prob"], errors="coerce")
-spc_df["alert"] = spc_df["alert"].astype(bool)
-spc_df = spc_df.dropna(subset=["timestamp", "cal_prob"]).reset_index(drop=True)
-
-mean_r = float(spc_df["cal_prob"].mean()) if len(spc_df) else 0.0
-std_r = float(spc_df["cal_prob"].std(ddof=0)) if len(spc_df) else 0.0
-ucl = mean_r + 2 * std_r
+spc_df["timestamp"] = pd.to_datetime(spc_df["timestamp"])
+spc_df["cal_prob"] = spc_df["cal_prob"].astype(float)
+mean_r = float(spc_df["cal_prob"].mean())
+std_r = float(spc_df["cal_prob"].std(ddof=0))
+ucl = mean_r + 2 * std_r  # upper control limit (±2σ reference band)
 lcl = max(0.0, mean_r - 2 * std_r)
 
-fig, ax = plt.subplots(figsize=(14, 3.8))
-fig.patch.set_facecolor("#0D1117")
-ax.set_facecolor("#0D1117")
+spc_df_line = spc_df.copy()
+spc_df_pts  = spc_df.copy()
 
-if len(spc_df):
-    ax.plot(
-        spc_df["timestamp"],
-        spc_df["cal_prob"],
-        color=ACCENT,
-        linewidth=1.4,
-        label="risk score",
+line = to_chart(spc_df_line).mark_line(color=ACCENT, strokeWidth=1.4).encode(
+    x=alt.X("timestamp:T", axis=AXIS, title="time"),
+    y=alt.Y("cal_prob:Q", axis=AXIS, title="risk score"),
+)
+breaches = to_chart(spc_df_pts).transform_filter(alt.datum.cal_prob >= threshold).mark_circle(
+    color=COL_ALERT, size=28
+).encode(x="timestamp:T", y="cal_prob:Q")
+
+def rule(df_src, val, color, dash):
+    _tmp = pd.DataFrame({"_rule_val": [float(val)] * len(df_src)})
+    return (
+        to_chart(_tmp)
+        .mark_rule(color=color, strokeDash=dash, strokeWidth=1)
+        .encode(y=alt.Y("mean(_rule_val):Q"))
     )
 
-    breach_df = spc_df[spc_df["cal_prob"] >= float(threshold)]
-    if not breach_df.empty:
-        ax.scatter(
-            breach_df["timestamp"],
-            breach_df["cal_prob"],
-            color=COL_ALERT,
-            s=28,
-            label="alerts",
-            zorder=3,
-        )
+mean_rule = rule(spc_df, mean_r, "#8B98A8", [4, 0])
+ucl_rule  = rule(spc_df, ucl,    COL_WATCH, [5, 4])
+thr_rule  = rule(spc_df, threshold, COL_ALERT, [5, 4])
 
-ax.axhline(mean_r, color="#8B98A8", linestyle="-", linewidth=1, label="mean")
-ax.axhline(ucl, color=COL_WATCH, linestyle=(0, (5, 4)), linewidth=1, label="+2σ")
-ax.axhline(float(threshold), color=COL_ALERT, linestyle=(0, (5, 4)), linewidth=1, label="threshold")
-
-ax.set_xlabel("time", color="#8B98A8")
-ax.set_ylabel("risk score", color="#8B98A8")
-ax.tick_params(axis="x", colors="#8B98A8", labelrotation=0)
-ax.tick_params(axis="y", colors="#8B98A8")
-ax.grid(True, color="#2A3441", alpha=0.45, linewidth=0.8)
-for spine in ax.spines.values():
-    spine.set_color("#1F2937")
-
-st.pyplot(fig, use_container_width=True)
-plt.close(fig)
-
+st.altair_chart(
+    themed(line + breaches + mean_rule + ucl_rule + thr_rule, height=300),
+    use_container_width=True,
+)
 st.caption(
     f"Center line = mean ({mean_r:.3f}, grey). +2σ control limit ({ucl:.3f}, amber). "
     f"Operating threshold ({threshold:.3f}, red): points above it are flagged alerts. "
     "The score is a relative triage indicator, not a calibrated probability of failure."
 )
+
 st.markdown("")
 
 # --- Alert-rate trend: full width ---
 st.markdown("##### Alert-rate trend")
-trend = df.sort_values("timestamp")[["timestamp", "alert"]].copy()
+trend = (
+    df.sort_values("timestamp")[["timestamp", "alert"]]
+    .copy()
+    .reset_index(drop=True)
+)
+trend["timestamp"] = pd.to_datetime(trend["timestamp"])
+trend["alert"] = trend["alert"].astype(float)
 win = max(10, len(trend) // 12)
 trend["alert_rate"] = trend["alert"].rolling(win, min_periods=1).mean() * 100
-trend_chart = alt.Chart(trend).mark_area(
-    line={"color": COL_WATCH}, color=alt.Gradient(
-        gradient="linear",
-        stops=[alt.GradientStop(color="rgba(232,161,58,0.05)", offset=0),
-               alt.GradientStop(color="rgba(232,161,58,0.35)", offset=1)],
-        x1=1, x2=1, y1=1, y2=0,
-    )
+trend["alert_rate"] = trend["alert_rate"].astype(float)
+trend_chart = to_chart(trend).mark_area(
+    line={"color": COL_WATCH, "strokeWidth": 1.6},
+    color=COL_WATCH,
+    opacity=0.25,
 ).encode(
     x=alt.X("timestamp:T", axis=AXIS, title="time"),
     y=alt.Y("alert_rate:Q", axis=AXIS, title="alert rate (%)"),
@@ -835,145 +671,44 @@ mid, right = st.columns(2)
 
 with mid:
     st.markdown("##### Risk band distribution")
-
-    # RISK_BAND_FINAL_FIX:
-    # Calculate displayed bar counts directly from cal_prob and the current sidebar threshold.
-    # This avoids using a stale risk_level column that may have been written earlier to the gold table.
-    _score_for_band = pd.to_numeric(df["cal_prob"], errors="coerce").fillna(0.0)
-    _medium_cutoff = float(threshold) * MEDIUM_BAND_MULT
-    _high_cutoff = float(threshold) * HIGH_BAND_MULT
-    _critical_cutoff = float(threshold) * CRITICAL_BAND_MULT
-
-    low_count = int((_score_for_band < _medium_cutoff).sum())
-    medium_count = int(((_score_for_band >= _medium_cutoff) & (_score_for_band < _high_cutoff)).sum())
-    high_count = int(((_score_for_band >= _high_cutoff) & (_score_for_band < _critical_cutoff)).sum())
-    critical_count = int((_score_for_band >= _critical_cutoff).sum())
-
-    band_order = ["Low", "Medium", "High", "Critical"]
-    risk_counts = pd.DataFrame({
-        "risk_level": band_order,
-        "count": [low_count, medium_count, high_count, critical_count],
-    })
-
-    # Keep tables synchronized with exactly the same displayed band logic.
-    df["risk_level"] = np.select(
-        [
-            _score_for_band >= _critical_cutoff,
-            _score_for_band >= _high_cutoff,
-            _score_for_band >= _medium_cutoff,
-        ],
-        ["Critical", "High", "Medium"],
-        default="Low",
+    risk_counts = (
+        df["risk_level"].value_counts()
+        .reindex(["Low", "Medium", "High"], fill_value=0)
+        .rename_axis("risk_level").reset_index(name="count")
+        .reset_index(drop=True)
     )
-
-    band_chart = alt.Chart(risk_counts).mark_bar().encode(
-        x=alt.X("risk_level:N", sort=band_order, axis=AXIS, title="risk band"),
+    risk_counts["risk_level"] = risk_counts["risk_level"].astype(str)
+    risk_counts["count"] = risk_counts["count"].astype(int)
+    band_chart = to_chart(risk_counts).mark_bar().encode(
+        x=alt.X("risk_level:N", sort=["Low", "Medium", "High"], axis=AXIS, title="risk band"),
         y=alt.Y("count:Q", axis=AXIS, title="count"),
         color=alt.Color("risk_level:N", scale=alt.Scale(
-            domain=band_order, range=[COL_STABLE, COL_WATCH, COL_ALERT, "#9B1C31"]
+            domain=["Low", "Medium", "High"], range=[COL_STABLE, COL_WATCH, COL_ALERT]
         ), legend=None),
-        tooltip=["risk_level:N", "count:Q"],
     )
     st.altair_chart(themed(band_chart, height=240), use_container_width=True)
-    st.caption(
-        f"Bands from current threshold: Low < {_medium_cutoff:.3f}; "
-        f"Medium {_medium_cutoff:.3f}-{_high_cutoff:.3f}; "
-        f"High {_high_cutoff:.3f}-{_critical_cutoff:.3f}; "
-        f"Critical ≥ {_critical_cutoff:.3f}. "
-        f"Counts: Low={low_count}, Medium={medium_count}, High={high_count}, Critical={critical_count}."
-    )
+    st.caption("Low / Medium / High by severity.")
 
 with right:
     st.markdown("##### Score distribution")
-    hist_df = df[["cal_prob"]].copy()
-    hist_chart = alt.Chart(hist_df).mark_bar(color=ACCENT, opacity=0.75).encode(
+    hist_df = df[["cal_prob"]].copy().reset_index(drop=True)
+    hist_df["cal_prob"] = hist_df["cal_prob"].astype(float)
+    hist_chart = to_chart(hist_df).mark_bar(color=ACCENT, opacity=0.75).encode(
         x=alt.X("cal_prob:Q", bin=alt.Bin(maxbins=30), axis=AXIS, title="calibrated score"),
         y=alt.Y("count():Q", axis=AXIS, title="count"),
     )
-    thr_line = alt.Chart(pd.DataFrame({"x": [threshold]})).mark_rule(
-        color=COL_ALERT, strokeDash=[5, 4], strokeWidth=1
-    ).encode(x="x:Q")
-    st.altair_chart(themed(alt.layer(hist_chart, thr_line), height=240), use_container_width=True)
+    _thr_df = pd.DataFrame({"_thr": [float(threshold)] * len(hist_df)})
+    thr_line = (
+        to_chart(_thr_df)
+        .mark_rule(color=COL_ALERT, strokeDash=[5, 4], strokeWidth=1)
+        .encode(x=alt.X("mean(_thr):Q"))
+    )
+    st.altair_chart(themed(hist_chart + thr_line, height=240), use_container_width=True)
     st.caption(f"Score density. Red line = alert threshold ({threshold:.3f}). Right-tail mass drives alert rate.")
 
 
-# --- SHAP attribution / root-cause explanation ---
-# IMPORTANT: This section only changes the SHAP presentation layer.
-# It does NOT change the live Delta read logic, MinIO connection, Kafka check,
-# threshold logic, or any upstream model output.
-
-ROOT_CAUSE_BUCKETS = [
-    "Chamber Pressure Instability",
-    "Gas Flow Deviation",
-    "RF Power Fluctuation",
-    "Etch Time Variation",
-    "Wafer Temperature Drift",
-    "Endpoint Signal Anomaly",
-    "Coolant Flow Instability",
-    "Deposition Rate Change",
-    "Vacuum Pressure Variation",
-    "Plasma Density Shift",
-    "Sensor Noise Pattern",
-    "Process Timing Variation",
-    "Plasma Uniformity Shift",
-    "Material Flow Variation",
-    "Equipment State Deviation",
-]
-
-ROOT_CAUSE_NAME_MAP = {
-    "feature_0": "Chamber Pressure Instability",
-    "feature_1": "Gas Flow Deviation",
-    "feature_2": "RF Power Fluctuation",
-    "feature_3": "Etch Time Variation",
-    "feature_4": "Wafer Temperature Drift",
-    "feature_5": "Endpoint Signal Anomaly",
-    "feature_6": "Coolant Flow Instability",
-    "feature_7": "Deposition Rate Change",
-    "feature_8": "Vacuum Pressure Variation",
-    "feature_9": "Plasma Density Shift",
-    "f_0": "Chamber Pressure Instability",
-    "f_1": "Gas Flow Deviation",
-    "f_2": "RF Power Fluctuation",
-    "f_3": "Etch Time Variation",
-    "f_4": "Wafer Temperature Drift",
-    "f_5": "Endpoint Signal Anomaly",
-    "f_6": "Coolant Flow Instability",
-    "f_7": "Deposition Rate Change",
-    "f_8": "Vacuum Pressure Variation",
-    "f_9": "Plasma Density Shift",
-}
-
-
-def pretty_root_cause(raw_feature) -> str:
-    """
-    Convert raw/anonymized feature IDs into presentation-friendly process-driver labels.
-    This is a dashboard display mapping only. It does not change model scoring.
-    """
-    if raw_feature is None or pd.isna(raw_feature):
-        return "Unknown Process Driver"
-
-    raw = str(raw_feature).strip()
-    if not raw or raw.upper() == "UNKNOWN":
-        return "Unknown Process Driver"
-
-    if raw in ROOT_CAUSE_NAME_MAP:
-        return ROOT_CAUSE_NAME_MAP[raw]
-
-    lower = raw.lower().replace(" ", "_")
-    if lower in ROOT_CAUSE_NAME_MAP:
-        return ROOT_CAUSE_NAME_MAP[lower]
-
-    # Many SECOM-derived features arrive as F085, F486, feature_123, etc.
-    # We map the numeric part deterministically into readable process-driver buckets.
-    digits = "".join(ch for ch in raw if ch.isdigit())
-    if digits:
-        return ROOT_CAUSE_BUCKETS[int(digits) % len(ROOT_CAUSE_BUCKETS)]
-
-    # If the name is already descriptive, just clean it for display.
-    return raw.replace("_", " ").title()
-
-
-# Build SHAP data: use real live columns if present, else synthesize demo values.
+# --- SHAP attribution ---
+# Build SHAP data: use real columns if present, else synthesise plausible demo values.
 _DEMO_FEATS = [
     "Chamber pressure", "Gas flow rate", "RF power", "Etch time",
     "Wafer temp", "Endpoint signal", "Coolant flow", "Deposition rate",
@@ -981,122 +716,82 @@ _DEMO_FEATS = [
 ]
 
 if "top_shap_feat" in df.columns and "top_shap_value" in df.columns:
-    # Live: use real SHAP fields from the gold table.
+    # Live: pull most recent alert row for the per-row waterfall
     _alert_rows = df[df["alert"]].sort_values("scored_at", ascending=False)
     _shap_row_feat = _alert_rows["top_shap_feat"].iloc[0] if len(_alert_rows) else None
     _shap_row_val = float(_alert_rows["top_shap_value"].iloc[0]) if len(_alert_rows) else None
-    _shap_row_id = int(_alert_rows["row_id"].iloc[0]) if len(_alert_rows) and "row_id" in _alert_rows.columns else None
+    _shap_row_id = int(_alert_rows["row_id"].iloc[0]) if len(_alert_rows) else None
 
-    _shap_source = df.dropna(subset=["top_shap_feat", "top_shap_value"]).copy()
-    _shap_source = _shap_source[_shap_source["top_shap_feat"].astype(str).str.upper() != "UNKNOWN"]
-    _shap_source["top_shap_value"] = pd.to_numeric(_shap_source["top_shap_value"], errors="coerce")
-    _shap_source = _shap_source.dropna(subset=["top_shap_value"])
-    _shap_source["root_cause"] = _shap_source["top_shap_feat"].apply(pretty_root_cause)
-
+    # Aggregate: signed mean SHAP per feature (preserves direction)
     _shap_agg = (
-        _shap_source.groupby("root_cause")["top_shap_value"]
-        .agg(
-            shap_value=lambda s: float(s.abs().mean()),
-            signed_mean=lambda s: float(s.mean()),
-            occurrences="size",
-        )
-        .sort_values("shap_value", ascending=False)
+        df.groupby("top_shap_feat")["top_shap_value"]
+        .mean()
+        .sort_values(key=lambda s: s.abs(), ascending=False)
         .head(10)
-        .rename_axis("feature")
-        .reset_index()
+        .rename_axis("feature").reset_index(name="shap_value")
+        .reset_index(drop=True)
     )
-
-    if _shap_agg.empty:
-        _shap_agg = pd.DataFrame({
-            "feature": ["No SHAP data"],
-            "shap_value": [0.0],
-            "signed_mean": [0.0],
-            "occurrences": [0],
-        })
-
-    _shap_title = "Root Cause Analysis - SHAP Explainability"
-    _shap_caption = (
-        "Root-cause labels are presentation-friendly mappings of anonymized SECOM feature IDs. "
-        "Longer bars mean stronger average SHAP impact across scored rows. "
-        "The mapping improves interpretability without changing the model or live data pipeline."
-    )
+    _shap_agg["feature"] = _shap_agg["feature"].astype(str)
+    _shap_agg["shap_value"] = _shap_agg["shap_value"].astype(float)
+    _shap_title = "Mean |SHAP| by feature"
+    _shap_caption = "Average absolute SHAP value per feature across all scored rows. Longer bar = stronger average contribution to risk score."
 else:
-    # Demo: synthesize signed SHAP values for presentation if no SHAP columns exist.
+    # Demo: synthesise signed SHAP values for the most recent alert row
     rng2 = np.random.default_rng(42)
-    _feats = [pretty_root_cause(f) for f in _DEMO_FEATS]
+    _feats = _DEMO_FEATS
     _vals = rng2.normal(0, 0.04, size=len(_feats))
+    # Push top 3 to be meaningfully positive (these "drove" the alert)
     _vals[0] = rng2.uniform(0.09, 0.14)
     _vals[1] = rng2.uniform(0.05, 0.09)
     _vals[2] = rng2.uniform(0.03, 0.06)
     _vals[3] = rng2.uniform(-0.07, -0.03)
-    _shap_agg = pd.DataFrame({
-        "feature": _feats,
-        "shap_value": np.abs(_vals),
-        "signed_mean": _vals,
-        "occurrences": 1,
-    })
-    _shap_agg = _shap_agg.reindex(_shap_agg["shap_value"].sort_values(ascending=False).index)
+    _shap_agg = pd.DataFrame({"feature": _feats, "shap_value": _vals})
+    _shap_agg = _shap_agg.reindex(_shap_agg["shap_value"].abs().sort_values(ascending=False).index)
+    _shap_agg = _shap_agg.reset_index(drop=True)
+    _shap_agg["feature"] = _shap_agg["feature"].astype(str)
+    _shap_agg["shap_value"] = _shap_agg["shap_value"].astype(float)
     _alert_rows = df[df["alert"]].sort_values("scored_at", ascending=False)
-    _shap_row_id = int(_alert_rows["row_id"].iloc[0]) if len(_alert_rows) and "row_id" in _alert_rows.columns else None
-    _shap_row_feat = None
-    _shap_row_val = None
-    _shap_title = "Root Cause Analysis - SHAP Explainability"
+    _shap_row_id = int(_alert_rows["row_id"].iloc[0]) if len(_alert_rows) else None
+    _shap_title = "Top feature drivers — most recent alert"
     _shap_caption = (
-        "Demo SHAP explanation. Red labels indicate drivers that push risk upward; "
-        "green labels indicate drivers that reduce risk."
+        "Simulated SHAP values (demo mode). Red bars push the score toward alert; green bars push toward pass. "
+        "Feature names are anonymised (SECOM public dataset)."
     )
 
 st.markdown("")
 _row_label = f"row {_shap_row_id}" if _shap_row_id is not None else "latest alert"
-st.markdown(f"##### {_shap_title} ({_row_label})")
+st.markdown(f"##### SHAP — {_shap_title} ({_row_label})")
 
 _shap_agg = _shap_agg.copy()
+_shap_agg["color"] = _shap_agg["shap_value"].apply(
+    lambda v: COL_ALERT if v >= 0 else COL_STABLE
+)
 _shap_agg["abs_val"] = _shap_agg["shap_value"].abs()
-_shap_agg["direction"] = _shap_agg["signed_mean"].apply(lambda v: "increases risk" if v >= 0 else "reduces risk")
-_shap_agg["bar_color"] = _shap_agg["signed_mean"].apply(lambda v: COL_ALERT if v >= 0 else COL_STABLE)
-
-if len(_shap_agg):
-    _top_driver = _shap_agg.sort_values("abs_val", ascending=False).iloc[0]
-    _top_name = str(_top_driver["feature"])
-    _top_direction = str(_top_driver["direction"])
-    st.info(
-        f"Most influential process driver: **{_top_name}** — this driver **{_top_direction}** "
-        f"based on SHAP contribution in the selected live window."
-    )
+_shap_agg["direction"] = _shap_agg["shap_value"].apply(lambda v: "toward alert" if v >= 0 else "toward pass")
 
 _shap_chart = (
-    alt.Chart(_shap_agg)
+    to_chart(_shap_agg)
     .mark_bar(cornerRadiusEnd=3)
     .encode(
-        x=alt.X(
-            "shap_value:Q",
-            axis=AXIS,
-            title="Average |SHAP| impact",
-            scale=alt.Scale(domain=[0, float(_shap_agg["shap_value"].max()) * 1.15 if len(_shap_agg) else 1.0]),
-        ),
-        y=alt.Y(
-            "feature:N",
-            sort=alt.EncodingSortField(field="abs_val", order="descending"),
-            axis=AXIS,
-            title="",
-        ),
+        x=alt.X("shap_value:Q", axis=AXIS, title="SHAP value",
+                 scale=alt.Scale(domain=[
+                     float(_shap_agg["shap_value"].min()) * 1.15 if _shap_agg["shap_value"].min() < 0 else -0.01,
+                     float(_shap_agg["shap_value"].max()) * 1.15,
+                 ])),
+        y=alt.Y("feature:N", sort=alt.EncodingSortField(field="abs_val", order="descending"),
+                axis=AXIS, title=""),
         color=alt.condition(
-            alt.datum.signed_mean >= 0,
+            alt.datum.shap_value >= 0,
             alt.value(COL_ALERT),
             alt.value(COL_STABLE),
         ),
-        tooltip=[
-            alt.Tooltip("feature:N", title="Root-cause label"),
-            alt.Tooltip("shap_value:Q", title="Average |SHAP|", format=".4f"),
-            alt.Tooltip("signed_mean:Q", title="Mean signed SHAP", format=".4f"),
-            alt.Tooltip("direction:N", title="Effect"),
-            alt.Tooltip("occurrences:Q", title="Rows"),
-        ],
+        tooltip=["feature:N", "shap_value:Q", "direction:N"],
     )
 )
 
-st.altair_chart(themed(_shap_chart, height=320), use_container_width=True)
+st.altair_chart(themed(_shap_chart, height=300), use_container_width=True)
 st.caption(_shap_caption)
+
 
 # ---------------------------------------------------------------------
 # Model honesty panel - forward-looking, not self-flagellating
@@ -1139,20 +834,15 @@ with ac:
         alert_cols = ["timestamp", "row_id", "drift_score", "cal_prob", "top_shap_feat",
                       "top_shap_value", "risk_level", "label", "scored_at"]
         alert_cols = [c for c in alert_cols if c in alert_df.columns]
-        _alert_show = alert_df[alert_cols].head(25).copy()
-        if "top_shap_feat" in _alert_show.columns:
-            _alert_show["root_cause"] = _alert_show["top_shap_feat"].apply(pretty_root_cause)
-        st.dataframe(_alert_show, use_container_width=True, hide_index=True)
+        st.dataframe(alert_df[alert_cols].head(25), use_container_width=True, hide_index=True)
 
 with lc:
     st.subheader("Latest scored rows")
     all_cols = ["timestamp", "row_id", "drift_score", "raw_prob", "cal_prob",
                 "top_shap_feat", "top_shap_value", "alert", "risk_level", "label", "scored_at"]
     cols = [c for c in all_cols if c in df.columns]
-    _latest_show = df[cols].sort_values("scored_at", ascending=False).head(25).copy()
-    if "top_shap_feat" in _latest_show.columns:
-        _latest_show["root_cause"] = _latest_show["top_shap_feat"].apply(pretty_root_cause)
-    st.dataframe(_latest_show, use_container_width=True, hide_index=True)
+    st.dataframe(df[cols].sort_values("scored_at", ascending=False).head(25),
+                 use_container_width=True, hide_index=True)
 
 
 st.markdown("---")
@@ -1160,14 +850,3 @@ st.caption(
     "Live data: Delta gold table on MinIO, written by the Spark consumer. "
     "Demo data: simulated, clearly banner-flagged, inspired by the real model's weak class separation."
 )
-
-
-# ---------------------------------------------------------------------
-# Auto-refresh
-# ---------------------------------------------------------------------
-# The screen redraws every UI_REFRESH_SECS. Network health checks are cached
-# for STATUS_CACHE_SECS (longer), so a redraw reuses cached status and does not
-# re-ping MinIO/Kafka every cycle - the loop stays responsive even mid-timeout.
-if auto_refresh:
-    time.sleep(UI_REFRESH_SECS)
-    st.rerun()
