@@ -157,7 +157,17 @@ def check_gold_table() -> tuple[bool, str, pd.DataFrame | None]:
     optional_cols = {"drift_score", "top_shap_feat", "top_shap_value"}
     try:
         dt = DeltaTable(gold_path, storage_options=STORAGE_OPTIONS)
-        available = set(dt.schema().to_pyarrow().names)
+
+        # Compatibility fix for different deltalake / delta-rs versions.
+        # Some versions return a Schema object that has .to_pyarrow().names,
+        # while the Streamlit Cloud version currently returns a Schema object
+        # without .to_pyarrow(). In that case, schema.fields gives us the names.
+        schema = dt.schema()
+        try:
+            available = set(schema.to_pyarrow().names)
+        except AttributeError:
+            available = set(field.name for field in schema.fields)
+
         cols_to_read = sorted(required_cols | (optional_cols & available))
         try:
             df = dt.to_pandas(columns=cols_to_read)
